@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge-ai-monitor
+  labels:
+    name: edge-ai-monitor
+    project: reliability-monitor

@@ -1,0 +1,172 @@
+---
+# Test Case 3: Latency Spike Injection
+# This test injects network latency to test response time monitoring
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: latency-test-server
+  namespace: edge-ai-monitor
+  labels:
+    app: latency-test-server
+    test-type: fault-injection
+spec:
+  containers:
+  - name: slow-server
+    image: python:3.9-slim
+    command: ["python", "-c"]
+    args:
+    - |
+      import time
+      import random
+      from http.server import HTTPServer, BaseHTTPRequestHandler
+      import json
+      
+      class SlowHandler(BaseHTTPRequestHandler):
+          def do_GET(self):
+              # Add artificial delay
+              delay = random.uniform(2.0, 8.0)  # 2-8 seconds delay
+              print(f"Adding {delay:.2f}s delay to response")
+              time.sleep(delay)
+              
+              self.send_response(200)
+              self.send_header('Content-type', 'application/json')
+              self.end_headers()
+              
+              response = {
+                  'message': 'Slow response',
+                  'delay_seconds': delay,
+                  'timestamp': time.time()
+              }
+              self.wfile.write(json.dumps(response).encode())
+          
+          def do_POST(self):
+              # Even slower for POST requests
+              delay = random.uniform(5.0, 15.0)  # 5-15 seconds delay
+              print(f"Adding {delay:.2f}s delay to POST response")
+              time.sleep(delay)
+              
+              self.send_response(200)
+              self.send_header('Content-type', 'application/json')
+              self.end_headers()
+              
+              response = {
+                  'message': 'Slow POST response',
+                  'delay_seconds': delay,
+                  'timestamp': time.time()
+              }
+              self.wfile.write(json.dumps(response).encode())
+          
+          def log_message(self, format, *args):
+              # Suppress default logging
+              pass
+      
+      server = HTTPServer(('0.0.0.0', 8080), SlowHandler)
+      print("Slow server started on port 8080")
+      server.serve_forever()
+    ports:
+    - containerPort: 8080
+      name: http
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "300m"
+        memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: latency-test-service
+  namespace: edge-ai-monitor
+  labels:
+    app: latency-test-server
+    test-type: fault-injection
+spec:
+  selector:
+    app: latency-test-server
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+---
+# NetworkPolicy to add latency (if supported by CNI)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: latency-injection-policy
+  namespace: edge-ai-monitor
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: latency-test-server
+    ports:
+    - protocol: TCP
+      port: 8080
+---
+# Deployment that makes requests to slow server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: latency-test-client
+  namespace: edge-ai-monitor
+  labels:
+    app: latency-test-client
+    test-type: fault-injection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: latency-test-client
+  template:
+    metadata:
+      labels:
+        app: latency-test-client
+        test-type: fault-injection
+    spec:
+      containers:
+      - name: client
+        image: python:3.9-slim
+        command: ["python", "-c"]
+        args:
+        - |
+          import time
+          import requests
+          import random
+          
+          service_url = "http://latency-test-service:8080"
+          
+          while True:
+              try:
+                  print(f"Making request to {service_url}")
+                  start_time = time.time()
+                  
+                  response = requests.get(service_url, timeout=20)
+                  end_time = time.time()
+                  
+                  print(f"Response received in {end_time - start_time:.2f}s")
+                  print(f"Response: {response.text}")
+                  
+                  # Wait before next request
+                  time.sleep(random.uniform(10, 30))
+                  
+              except Exception as e:
+                  print(f"Request failed: {e}")
+                  time.sleep(5)
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"

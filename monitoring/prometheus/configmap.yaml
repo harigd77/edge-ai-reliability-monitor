@@ -1,0 +1,276 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: edge-ai-monitor
+  labels:
+    app: prometheus
+    component: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: 'edge-ai-monitor'
+        replica: 'prometheus-1'
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yml"
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: []
+
+    scrape_configs:
+      # Prometheus itself
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+        scrape_interval: 30s
+        metrics_path: /metrics
+
+      # Kubernetes API Server
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: default;kubernetes;https
+
+      # Node Exporter
+      - job_name: 'kubernetes-nodes'
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      # Kubelet
+      - job_name: 'kubernetes-kubelet'
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+      # cAdvisor
+      - job_name: 'kubernetes-cadvisor'
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+      # Application Services
+      - job_name: 'edge-ai-services'
+        kubernetes_sd_configs:
+          - role: endpoints
+          - namespaces:
+              names:
+                - edge-ai-monitor
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_name
+
+      # Kubernetes Pods
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+          - namespaces:
+              names:
+                - edge-ai-monitor
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+
+  # Alerting rules
+  alert_rules.yml: |
+    groups:
+    - name: edge-ai-monitor.rules
+      rules:
+      # API Service Alerts
+      - alert: APIServiceDown
+        expr: up{job="edge-ai-services", kubernetes_name="api-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: api-service
+        annotations:
+          summary: "API Service is down"
+          description: "API Service has been down for more than 1 minute."
+
+      - alert: APIHighResponseTime
+        expr: histogram_quantile(0.95, rate(api_request_duration_seconds_bucket[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+          service: api-service
+        annotations:
+          summary: "API Service high response time"
+          description: "95th percentile response time is {{ $value }}s for more than 2 minutes."
+
+      - alert: APIHighErrorRate
+        expr: rate(api_requests_total{status_code=~"5.."}[5m]) / rate(api_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: api-service
+        annotations:
+          summary: "API Service high error rate"
+          description: "Error rate is {{ $value | humanizePercentage }} for more than 2 minutes."
+
+      # Auth Service Alerts
+      - alert: AuthServiceDown
+        expr: up{job="edge-ai-services", kubernetes_name="auth-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: auth-service
+        annotations:
+          summary: "Auth Service is down"
+          description: "Auth Service has been down for more than 1 minute."
+
+      - alert: AuthHighFailureRate
+        expr: rate(auth_attempts_total{result="failed"}[5m]) / rate(auth_attempts_total[5m]) > 0.2
+        for: 2m
+        labels:
+          severity: warning
+          service: auth-service
+        annotations:
+          summary: "High authentication failure rate"
+          description: "Authentication failure rate is {{ $value | humanizePercentage }} for more than 2 minutes."
+
+      # Telemetry Service Alerts
+      - alert: TelemetryServiceDown
+        expr: up{job="edge-ai-services", kubernetes_name="telemetry-generator"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: telemetry-generator
+        annotations:
+          summary: "Telemetry Service is down"
+          description: "Telemetry Service has been down for more than 1 minute."
+
+      # System Resource Alerts
+      - alert: HighCPUUsage
+        expr: system_resource_usage_percent{resource_type="cpu"} > 80
+        for: 5m
+        labels:
+          severity: warning
+          resource: cpu
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is {{ $value }}% for more than 5 minutes on {{ $labels.instance }}."
+
+      - alert: HighMemoryUsage
+        expr: system_resource_usage_percent{resource_type="memory"} > 85
+        for: 5m
+        labels:
+          severity: warning
+          resource: memory
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value }}% for more than 5 minutes on {{ $labels.instance }}."
+
+      # Network Alerts
+      - alert: HighPacketLoss
+        expr: packet_loss_percent > 5
+        for: 2m
+        labels:
+          severity: critical
+          resource: network
+        annotations:
+          summary: "High packet loss detected"
+          description: "Packet loss is {{ $value }}% on interface {{ $labels.interface }}."
+
+      - alert: HighNetworkLatency
+        expr: histogram_quantile(0.95, rate(network_latency_ms_bucket[5m])) > 200
+        for: 2m
+        labels:
+          severity: warning
+          resource: network
+        annotations:
+          summary: "High network latency detected"
+          description: "95th percentile network latency is {{ $value }}ms."
+
+      # Base Station Alerts
+      - alert: BaseStationDown
+        expr: base_station_status == -1
+        for: 1m
+        labels:
+          severity: critical
+          resource: infrastructure
+        annotations:
+          summary: "Base station is down"
+          description: "Base station {{ $labels.station_id }} in {{ $labels.location }} is down."
+
+      - alert: LowConnectedUsers
+        expr: connected_users_total < 50
+        for: 5m
+        labels:
+          severity: warning
+          resource: business
+        annotations:
+          summary: "Low number of connected users"
+          description: "Only {{ $value }} users connected to cell tower {{ $labels.cell_tower }}."

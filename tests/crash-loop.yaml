@@ -1,0 +1,109 @@
+---
+# Test Case 2: Pod Crash Loop Injection
+# This test creates a pod that crashes repeatedly to test
+# restart monitoring and anomaly detection
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-loop-test
+  namespace: edge-ai-monitor
+  labels:
+    app: crash-loop-test
+    test-type: fault-injection
+spec:
+  containers:
+  - name: crash-container
+    image: alpine:latest
+    command: ["sh", "-c"]
+    args:
+    - |
+      echo "Starting crash loop test..."
+      sleep 10
+      echo "Simulating application crash..."
+      exit 1
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+  restartPolicy: Always
+---
+# Deployment with intentional crash loop
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-loop-deployment
+  namespace: edge-ai-monitor
+  labels:
+    app: crash-loop-deployment
+    test-type: fault-injection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-loop-deployment
+  template:
+    metadata:
+      labels:
+        app: crash-loop-deployment
+        test-type: fault-injection
+    spec:
+      containers:
+      - name: failing-app
+        image: python:3.9-slim
+        command: ["python", "-c"]
+        args:
+        - |
+          import time
+          import random
+          import sys
+          
+          crash_probability = 0.7  # 70% chance to crash
+          
+          while True:
+              print("Application running normally...")
+              time.sleep(5)
+              
+              if random.random() < crash_probability:
+                  print("Simulating application crash!")
+                  sys.exit(1)
+              
+              print("Continuing normal operation...")
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - |
+              if [ $((RANDOM % 10)) -lt 3 ]; then
+                exit 1  # Fail 30% of the time
+              else
+                exit 0
+              fi
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 2
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - |
+              if [ $((RANDOM % 10)) -lt 2 ]; then
+                exit 1  # Fail 20% of the time
+              else
+                exit 0
+              fi
+          initialDelaySeconds: 5
+          periodSeconds: 3
+          failureThreshold: 3

@@ -1,0 +1,210 @@
+---
+# Test Case 4: Traffic Burst Injection
+# This test creates a sudden burst of traffic to test
+# autoscaling and load handling capabilities
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-burst-script
+  namespace: edge-ai-monitor
+data:
+  burst-generator.py: |
+    import time
+    import requests
+    import threading
+    import random
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    import sys
+    
+    class TrafficBurstGenerator:
+        def __init__(self):
+            self.targets = [
+                'http://api-service:8000/health',
+                'http://api-service:8000/api/users',
+                'http://auth-service:3001/health',
+                'http://telemetry-generator:8001/health'
+            ]
+            self.active_requests = 0
+            self.total_requests = 0
+            self.failed_requests = 0
+            
+        def make_request(self, url, request_id):
+            try:
+                self.active_requests += 1
+                
+                # Add random headers to simulate different users
+                headers = {
+                    'User-Agent': f'BurstClient-{request_id}',
+                    'X-Request-ID': f'req-{request_id}-{int(time.time())}'
+                }
+                
+                start_time = time.time()
+                response = requests.get(url, headers=headers, timeout=10)
+                end_time = time.time()
+                
+                self.total_requests += 1
+                
+                if response.status_code >= 400:
+                    self.failed_requests += 1
+                
+                print(f"Request {request_id}: {url} - {response.status_code} - {end_time - start_time:.3f}s")
+                
+            except Exception as e:
+                self.failed_requests += 1
+                print(f"Request {request_id} failed: {e}")
+            finally:
+                self.active_requests -= 1
+        
+        def generate_burst(self, concurrent_requests=50, duration_seconds=60):
+            print(f"Starting traffic burst: {concurrent_requests} concurrent requests for {duration_seconds}s")
+            
+            start_time = time.time()
+            request_id = 0
+            
+            with ThreadPoolExecutor(max_workers=concurrent_requests) as executor:
+                while time.time() - start_time < duration_seconds:
+                    # Submit multiple requests concurrently
+                    for _ in range(concurrent_requests):
+                        target_url = random.choice(self.targets)
+                        executor.submit(self.make_request, target_url, request_id)
+                        request_id += 1
+                    
+                    # Small delay between bursts
+                    time.sleep(0.1)
+            
+            # Wait for all requests to complete
+            time.sleep(5)
+            
+            print(f"Burst completed:")
+            print(f"  Total requests: {self.total_requests}")
+            print(f"  Failed requests: {self.failed_requests}")
+            print(f"  Success rate: {((self.total_requests - self.failed_requests) / self.total_requests * 100):.1f}%")
+    
+    if __name__ == "__main__":
+        generator = TrafficBurstGenerator()
+        
+        # Generate traffic burst
+        concurrent_requests = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+        duration = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+        
+        generator.generate_burst(concurrent_requests, duration)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-burst-generator
+  namespace: edge-ai-monitor
+  labels:
+    app: traffic-burst-generator
+    test-type: fault-injection
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: traffic-burst-generator
+  template:
+    metadata:
+      labels:
+        app: traffic-burst-generator
+        test-type: fault-injection
+    spec:
+      containers:
+      - name: burst-generator
+        image: python:3.9-slim
+        command: ["python", "/scripts/burst-generator.py", "100", "120"]
+        volumeMounts:
+        - name: script-volume
+          mountPath: /scripts
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+      volumes:
+      - name: script-volume
+        configMap:
+          name: traffic-burst-script
+---
+# HorizontalPodAutoscaler for API Service (if metrics server is available)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: edge-ai-monitor
+  labels:
+    app: api-service
+    test-type: autoscaling-test
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+---
+# HorizontalPodAutoscaler for Auth Service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: auth-service-hpa
+  namespace: edge-ai-monitor
+  labels:
+    app: auth-service
+    test-type: autoscaling-test
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: auth-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
